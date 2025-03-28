@@ -2,25 +2,61 @@ import os
 import requests
 import time
 import re
+import uuid
 from dotenv import load_dotenv
 import replicate
+import cloudinary
+import cloudinary.uploader
 
+# 🧪 Carrega variáveis do .env
 load_dotenv()
 
 REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
 COIN_GECKO_API = os.getenv("coin_gecko_api")
 
 if not REPLICATE_API_TOKEN or not COIN_GECKO_API:
-    raise ValueError("⚠️ Confira suas variáveis REPLICATE_API_TOKEN e coin_gecko_api no .env!")
+    raise ValueError(
+        "⚠️ Please check your REPLICATE_API_TOKEN and coin_gecko_api variables in the .env file!"
+    )
 
 os.environ["REPLICATE_API_TOKEN"] = REPLICATE_API_TOKEN
+
+# 🔧 Cloudinary setup
+cloudinary.config(
+    secure=True,
+    cloud_name=os.getenv("CLOUDINARY_URL").split("@")[-1],
+    api_key=os.getenv("CLOUDINARY_API_KEY"),
+    api_secret=os.getenv("CLOUDINARY_API_SECRET"),
+)
+
+# 🌟 Imagem do avatar
+SADTALKER_IMAGE_URL = "https://res.cloudinary.com/dixebxp5r/image/upload/c_crop,g_auto,h_800,w_800/renata"
 
 BASE_URL = "https://api.coingecko.com/api/v3"
 
 
-def montar_prompt_inicial(question):
+def clean_response(text):
+    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+
+
+def remove_emojis(text):
+    emoji_pattern = re.compile(
+        "["
+        "\U0001F600-\U0001F64F"
+        "\U0001F300-\U0001F5FF"
+        "\U0001F680-\U0001F6FF"
+        "\U0001F1E0-\U0001F1FF"
+        "\U00002702-\U000027B0"
+        "\U000024C2-\U0001F251"
+        "]+",
+        flags=re.UNICODE,
+    )
+    return emoji_pattern.sub(r"", text)
+
+
+def build_initial_prompt(question):
     return f'''
-Você é especialista na API CoinGecko. Escolha o endpoint correto para responder:
+You are an expert in the CoinGecko API. Choose the correct endpoint to answer:
 
 - /simple/price?ids={{coin}}&vs_currencies={{currency}}
 - /coins/{{coin}}/market_chart?vs_currency={{currency}}&days={{days}}
@@ -30,37 +66,37 @@ Você é especialista na API CoinGecko. Escolha o endpoint correto para responde
 - /exchange_rates
 - /global
 
-IMPORTANTE: Sempre que pedir médias, máximos, mínimos ou histórico, use /coins/{{coin}}/market_chart com parâmetros obrigatórios: vs_currency (usd), days (período).
+IMPORTANT: When asked about averages, highs, lows, or historical data, use /coins/{{coin}}/market_chart with required parameters: vs_currency (usd), days (period).
 
-Retorne APENAS o endpoint completo com parâmetros, SEM a URL base, entre ASTERISCOS DUPLOS (**), como no exemplo:
+Return ONLY the full endpoint with parameters, WITHOUT the base URL, surrounded by DOUBLE ASTERISKS (**), like this:
 **/simple/price?ids=bitcoin&vs_currencies=usd**
 
-Pergunta a responder:
+User question:
 "{question}"
 '''
 
 
-def montar_prompt_alternativo(question, endpoints_falhos):
+def build_alternative_prompt(question, failed_endpoints):
     return f'''
-O(s) endpoint(s) anterior(es) falhou(falharam): {endpoints_falhos}.
-Escolha outro endpoint válido para responder à pergunta: "{question}".
+The previous endpoint(s) failed: {failed_endpoints}.
+Choose another valid endpoint to answer the question: "{question}".
 
-Retorne APENAS o endpoint completo com parâmetros, SEM a URL base, entre ASTERISCOS DUPLOS (**), como no exemplo:
+Return ONLY the full endpoint with parameters, WITHOUT the base URL, surrounded by DOUBLE ASTERISKS (**), like this:
 **/coins/bitcoin**
 
-Sem explicações adicionais.
+No additional explanations.
 '''
 
 
-def montar_prompt_final(question, coin_data):
+def build_final_prompt(question, coin_data):
     return f'''
-O usuário perguntou: "{question}". Com base nestes dados da API CoinGecko: {coin_data}, responda de maneira descontraída, divertida, clara e em primeira pessoa.
+The user asked: "{question}". Based on this data from the CoinGecko API: {coin_data}, answer in a friendly, humorous, clear, and first-person tone.
 '''
 
 
-def consultar_deepseek_stream(prompt):
-    resposta_final = ""
-    for evento in replicate.stream(
+def query_deepseek_stream(prompt):
+    raw_response = ""
+    for event in replicate.stream(
         "deepseek-ai/deepseek-r1",
         input={
             "prompt": prompt,
@@ -68,80 +104,192 @@ def consultar_deepseek_stream(prompt):
             "max_tokens": 20480,
             "temperature": 0.2,
             "presence_penalty": 0,
-            "frequency_penalty": 0
+            "frequency_penalty": 0,
         },
     ):
-        resposta_final += str(evento)
-        print(str(evento), end="", flush=True)
-    print()
-    return resposta_final.strip()
+        raw_response += str(event)
+
+    final_response = clean_response(raw_response)
+    return final_response.strip()
 
 
-def consultar_coingecko(endpoint):
+def query_coingecko(endpoint):
     headers = {
-        'accept': 'application/json',
-        'x-cg-demo-api-key': COIN_GECKO_API
+        "accept": "application/json",
+        "x-cg-demo-api-key": COIN_GECKO_API,
     }
     response = requests.get(endpoint, headers=headers)
     response.raise_for_status()
     return response.json()
 
 
-def extrair_endpoint(resposta):
-    match = re.search(r"\*\*(.*?)\*\*", resposta)
+def extract_endpoint(response):
+    match = re.search(r"\*\*(.*?)\*\*", response)
     return match.group(1).strip() if match else None
 
 
-def obter_dados(question):
-    endpoints_falhos = []
-    for tentativa in range(2):
-        prompt = (montar_prompt_inicial(question) if tentativa == 0
-                  else montar_prompt_alternativo(question, endpoints_falhos))
+def get_data(question):
+    failed_endpoints = []
+    for attempt in range(2):
+        prompt = build_initial_prompt(
+            question) if attempt == 0 else build_alternative_prompt(question, failed_endpoints)
+        response_text = query_deepseek_stream(prompt)
+        endpoint = extract_endpoint(response_text)
 
-        resposta_completa = consultar_deepseek_stream(prompt)
-        endpoint_gerado = extrair_endpoint(resposta_completa)
-
-        if not endpoint_gerado:
-            print("⚠️ Não consegui extrair o endpoint da resposta do modelo.")
-            endpoints_falhos.append("Extração falhou")
+        if not endpoint:
+            print("⚠️ Failed to extract endpoint from model response.")
+            failed_endpoints.append("Extraction failed")
             continue
 
-        endpoint_completo = BASE_URL + endpoint_gerado
+        full_url = BASE_URL + endpoint
 
         try:
-            dados = consultar_coingecko(endpoint_completo)
-            return dados
+            return query_coingecko(full_url)
         except requests.HTTPError as e:
-            print(f"⚠️ Erro na consulta ao CoinGecko (tentativa {tentativa+1}): {e}")
-            endpoints_falhos.append(endpoint_gerado)
-            if tentativa == 0:
-                print("🔄 Tentando endpoint alternativo...")
+            print(f"⚠️ CoinGecko request error (attempt {attempt+1}): {e}")
+            failed_endpoints.append(endpoint)
+            if attempt == 0:
+                print("🔄 Trying alternative endpoint...")
                 time.sleep(1)
             else:
-                print("❌ Endpoint alternativo também falhou.")
+                print("❌ Alternative endpoint also failed.")
     return None
 
 
+def save_audio_from_replicate(text):
+    try:
+        # Sanitiza o texto para o modelo TTS não surtar
+        sanitized_text = text.replace("\n", " ").strip()
+        sanitized_text = re.sub(r"[^\x00-\x7F]+", " ", sanitized_text)
+
+        output_url = replicate.run(
+            "adirik/styletts2:989cb5ea6d2401314eb30685740cb9f6fd1c9001b8940659b406f952837ab5ac",
+            input={
+                "beta": 0.7,
+                "seed": 0,
+                "text": sanitized_text,
+                "alpha": 0.3,
+                "diffusion_steps": 10,
+                "embedding_scale": 1.5,
+            },
+        )
+
+        if not output_url:
+            print("⚠️ Failed to generate audio.")
+            return None
+
+        audio_id = str(uuid.uuid4())
+        audio_path = f"static/audio/{audio_id}.wav"
+
+        os.makedirs("static/audio", exist_ok=True)
+        audio_data = requests.get(output_url).content
+        with open(audio_path, "wb") as f:
+            f.write(audio_data)
+
+        return audio_path
+
+    except Exception as e:
+        print(f"❌ Erro ao gerar o áudio com o StyleTTS2: {e}")
+        return None
+
+
+def upload_to_cloudinary(audio_path):
+    try:
+        response = cloudinary.uploader.upload(
+            audio_path, resource_type="video")
+        return response.get("secure_url")
+    except Exception as e:
+        print(f"❌ Cloudinary upload failed: {e}")
+        return None
+
+
+def generate_video_with_avatar(audio_url):
+    print("🎥 Gerando vídeo animado com fala sincronizada...")
+
+    try:
+        output_url = replicate.run(
+            "cjwbw/sadtalker:a519cc0cfebaaeade068b23899165a11ec76aaa1d2b313d40d214f204ec957a3",
+            input={
+                "facerender": "facevid2vid",
+                "pose_style": 0,
+                "preprocess": "crop",
+                "still_mode": True,
+                "driven_audio": audio_url,
+                "source_image": SADTALKER_IMAGE_URL,
+                "use_enhancer": True,
+                "use_eyeblink": True,
+                "size_of_image": 256,
+                "expression_scale": 1
+            }
+        )
+
+        if not output_url:
+            print("⚠️ Falha ao gerar o vídeo.")
+            return None
+
+        video_id = str(uuid.uuid4())
+        video_path = f"static/video/{video_id}.mp4"
+
+        os.makedirs("static/video", exist_ok=True)
+        video_data = requests.get(output_url).content
+        with open(video_path, "wb") as f:
+            f.write(video_data)
+
+        return video_path
+
+    except Exception as e:
+        print(f"❌ Erro ao gerar vídeo no SadTalker: {e}")
+        return None
+
+
 def main():
-    print("🚀 Bem-vindo ao Consultor Cripto Avançado com DeepSeek! 🚀\n")
+    print("🚀 Welcome to the Advanced Crypto Consultant with DeepSeek! 🚀\n")
 
     while True:
-        question = input("🪙 O que deseja consultar no mundo das criptos? (ou digite 'sair')\n👉 ").strip()
+        question = input(
+            "🪙 What do you want to ask about the crypto world? (type 'exit' to quit)\n👉 ").strip()
 
-        if question.lower() == "sair":
-            print("👋 Até mais! Bons investimentos!")
+        if question.lower() == "exit":
+            print("👋 See you next time! Happy investing!")
             break
 
-        print("\n🔍 Consultando CoinGecko com ajuda do DeepSeek...\n")
-
-        coin_data = obter_dados(question)
+        print("\n🔍 Querying CoinGecko with DeepSeek help...\n")
+        coin_data = get_data(question)
 
         if coin_data:
-            print("\n💬 Gerando resposta personalizada:\n")
-            consultar_deepseek_stream(montar_prompt_final(question, coin_data))
-            print("\n✅ Concluído com sucesso!\n")
+            print("\n💬 Generating personalized response:\n")
+            final_answer_with_emojis = query_deepseek_stream(
+                build_final_prompt(question, coin_data))
+            final_answer_clean = remove_emojis(final_answer_with_emojis)
+
+            # debug opcional
+            print(f"🧪 Texto enviado para TTS: {final_answer_clean}")
+
+            audio_path = save_audio_from_replicate(final_answer_clean)
+
+            if audio_path:
+                public_url = upload_to_cloudinary(audio_path)
+
+                if public_url:
+                    video_path = generate_video_with_avatar(public_url)
+
+                    print(final_answer_with_emojis)
+                    print(f"\n🔊 Áudio salvo localmente em: {audio_path}")
+                    print(f"🌐 URL pública do áudio: {public_url}")
+
+                    if video_path:
+                        print(f"🎬 Vídeo gerado e salvo em: {video_path}")
+                    else:
+                        print("⚠️ Falha ao gerar o vídeo animado.")
+                else:
+                    print("⚠️ Não foi possível gerar a URL pública do áudio.")
+            else:
+                print("😕 Audio generation failed, but here's the text:")
+                print(final_answer_with_emojis)
+
+            print("\n✅ All done!\n")
         else:
-            print("\n😢 Não consegui obter as informações desta vez. Tente outra consulta!\n")
+            print("\n😢 Couldn't get the info this time. Try another question!\n")
 
 
 if __name__ == "__main__":
